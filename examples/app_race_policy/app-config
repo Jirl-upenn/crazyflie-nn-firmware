@@ -4,6 +4,6 @@ CONFIG_APP_STACKSIZE=350
 # Makes race_controller.c's controllerOutOfTree() the SOLE controller for
 # the whole flight — see that file's docstring. It therefore delegates to
 # controllerPid() for takeoff/hover/land and only bypasses PID (via
-# controlModeForce/normalizedForces, mixer.c + kf conversion) while a race
-# observation stream is actually arriving.
+# controlModeForce/normalizedForces, mixer.c + kf conversion) while a
+# ground-streamed action stream is actually arriving.
 CONFIG_CONTROLLER_OOT=y

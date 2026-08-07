@@ -1,6 +1,4 @@
 obj-y += app_race_policy.o
 obj-y += mixer.o
 obj-y += race_controller.o
-obj-y += obs_channel.o
-obj-y += policy.o
-obj-y += policy_mem.o
+obj-y += action_channel.o

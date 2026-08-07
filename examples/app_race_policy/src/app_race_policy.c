@@ -2,12 +2,12 @@
  * app_race_policy.c — app entry point.
  *
  * controllerOutOfTree() (race_controller.c) arbitrates per flight phase
- * between the stock PID controller and the ground-streamed policy — see
- * that file's docstring. The app-channel receive (obs_channel.c) and the
- * exported policy's forward pass (policy.c) are both wired in and driven
- * from that controller. appMain() itself has nothing to do — the FreeRTOS
- * stabilizer task calls controllerOutOfTree() on its own schedule,
- * independent of this app task — so it just idles.
+ * between the stock PID controller and a ground-streamed policy action —
+ * see that file's docstring. The app-channel receive (action_channel.c) is
+ * driven from that controller; no network runs onboard any more. appMain()
+ * itself has nothing to do — the FreeRTOS stabilizer task calls
+ * controllerOutOfTree() on its own schedule, independent of this app task
+ * — so it just idles.
  */
 #include "app.h"
 
