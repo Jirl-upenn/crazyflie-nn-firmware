@@ -1,15 +1,24 @@
 /**
- * race_controller.c — controllerOutOfTree() hook. Arbitrates between the
- * stock PID controller and a ground-streamed policy action, per flight
- * phase.
+ * race_controller.c — controllerOutOfTree() hook. Arbitrates between four
+ * modes, per flight phase: the stock PID controller, the stock Mellinger
+ * controller (driven by the SAME standard setpoint every other controller
+ * receives — no separate channel), a ground-streamed open-loop mixer
+ * action, and a bench-test stand-in for the mixer path.
  *
  * CONFIG_CONTROLLER_OOT=y makes this function the SOLE controller for the
  * entire flight (controller.c's autoselect chain picks ControllerTypeOot,
  * and controller() dispatches every tick through this one function
- * pointer) — PID/Lee/Mellinger are never reached on their own. So anything
- * this function does not handle itself, nothing else will: takeoff, hover
- * and land included. It therefore delegates to controllerPid() for every
- * phase except an actively-streaming race.
+ * pointer) — PID/Lee/Mellinger are never reached via controller.c's own
+ * dispatch on their own (their controllerFunctions[] entries still exist
+ * and stabilizer.controller is technically still a writable param, but
+ * writing it swaps the ACTIVE controller away from controllerOutOfTree()
+ * entirely, discarding everything below — see MODE_MELLINGER instead,
+ * which calls controllerMellingerFirmware() directly from inside this
+ * function, keeping the arbitration/staleness/PID-fallback logic intact).
+ * So anything this function does not handle itself, nothing else will:
+ * takeoff, hover and land included. It therefore delegates to
+ * controllerPid() for every phase except an actively-streaming race or
+ * mellingerEnable being set.
  *
  * Getting this wrong is not subtle. Before this arbitration existed, this
  * function discarded `setpoint` outright and ran mixAttitudeRpm() on all
@@ -59,9 +68,23 @@
  * kf -> normalizedForces -> real motors) be verified in isolation, with no
  * ground station in the loop at all. Both flow through the exact same
  * mixer/thrust code below; only how action0..3 get set differs.
+ *
+ * MODE_MELLINGER (ctrlRace.mellingerEnable) is for "mellinger"-action_type
+ * checkpoints (crazyflow's own real physical [roll,pitch,yaw,thrust]
+ * attitude convention, distinct from the open-loop mixer's
+ * [thrustNorm,roll,pitch,yawRate]) — crazyflie_ros' JaxRacingPolicy sends
+ * a real attitude setpoint via the ordinary legacy RPYT commander, exactly
+ * like it would for stock Mellinger on a non-OOT build; this just calls
+ * controllerMellingerFirmware() on that same setpoint instead of
+ * controllerPid(), so ONE firmware image serves both action_types. No
+ * separate staleness check is needed here (unlike MODE_STREAM's
+ * actStaleTicks): a lost/stale setpoint is already firmware's generic
+ * commander/supervisor watchdog's job, independent of which controller is
+ * selected — see crtp_supervisor.c.
  */
 #include "controller.h"
 #include "controller_pid.h"
+#include "controller_mellinger.h"
 #include "power_distribution.h"
 #include "mixer.h"
 #include "action_channel.h"
@@ -107,14 +130,26 @@ static bool actEverReceived = false;
 // Never set this on a vehicle that is expected to fly under PID.
 static uint8_t benchEnable = 0;
 
-// Live mode, mirrored for ground-side logging: 0=PID, 1=stream, 2=bench.
-// Log this alongside ctrlRace.actPackets when diagnosing a flight — it is
-// the ground truth for which controller actually produced the motor
-// commands on any given tick.
+// Operator intent to route the standard setpoint (whatever the legacy
+// RPYT commander last decoded — see this file's docstring) through
+// controllerMellingerFirmware() instead of controllerPid(). Same
+// "intent, not sufficient alone" framing as actChannelEnable, but there is
+// no separate freshness check for it: an RPYT setpoint's own staleness is
+// already firmware's generic commander/supervisor watchdog's job.
+// Deliberately checked AFTER the stream check below, not before — a fresh
+// action stream always wins, so a vehicle mid-race on the mixer path never
+// silently drops to Mellinger if both happen to be set at once.
+static uint8_t mellingerEnable = 0;
+
+// Live mode, mirrored for ground-side logging: 0=PID, 1=stream, 2=bench,
+// 3=mellinger. Log this alongside ctrlRace.actPackets when diagnosing a
+// flight — it is the ground truth for which controller actually produced
+// the motor commands on any given tick.
 typedef enum {
-  MODE_PID    = 0,
-  MODE_STREAM = 1,
-  MODE_BENCH  = 2,
+  MODE_PID       = 0,
+  MODE_STREAM    = 1,
+  MODE_BENCH     = 2,
+  MODE_MELLINGER = 3,
 } RaceMode;
 static uint8_t modeLog = MODE_PID;
 
@@ -154,12 +189,13 @@ void controllerOutOfTreeInit(void)
   actEverReceived = false;
   modeLog = MODE_PID;
   actionChannelReset();
-  // Required: nothing else initializes PID when CONFIG_CONTROLLER_OOT=y,
-  // because controller.c only ever init()s the one selected controller —
-  // which is this one. Safe to call here and safe to call repeatedly in
-  // general; stabilizer.c does exactly that on every runtime controller
-  // switch.
+  // Required: nothing else initializes PID/Mellinger when
+  // CONFIG_CONTROLLER_OOT=y, because controller.c only ever init()s the
+  // one selected controller — which is this one. Safe to call here and
+  // safe to call repeatedly in general; stabilizer.c does exactly that on
+  // every runtime controller switch.
   controllerPidInit();
+  controllerMellingerFirmwareInit();
 }
 
 bool controllerOutOfTreeTest(void)
@@ -219,6 +255,8 @@ void controllerOutOfTree(control_t *control, const setpoint_t *setpoint,
     mode = MODE_BENCH;
   } else if (actChannelEnable != 0 && actFresh) {
     mode = MODE_STREAM;
+  } else if (mellingerEnable != 0) {
+    mode = MODE_MELLINGER;
   }
   modeLog = (uint8_t)mode;
 
@@ -234,6 +272,16 @@ void controllerOutOfTree(control_t *control, const setpoint_t *setpoint,
     // z-integral that was compensating hover thrust bias, and the vehicle
     // would sag on handback before rebuilding it.
     controllerPid(control, setpoint, sensors, state, stabilizerStep);
+    return;
+  }
+
+  if (mode == MODE_MELLINGER) {
+    // Same setpoint every other mode/controller receives (built upstream
+    // by the standard commander from crazyflie_ros' ordinary legacy RPYT
+    // send — see this file's docstring) — no action-channel involvement
+    // at all. controllerMellingerFirmware() writes control->controlMode
+    // (controlModeLegacy) itself, same as controllerPid() above.
+    controllerMellingerFirmware(control, setpoint, sensors, state, stabilizerStep);
     return;
   }
 
@@ -264,6 +312,7 @@ PARAM_GROUP_START(ctrlRace)
 PARAM_ADD(PARAM_UINT8, actChanEnable, &actChannelEnable)
 PARAM_ADD(PARAM_UINT16, actStaleTicks, &actStaleTicks)
 PARAM_ADD(PARAM_UINT8, benchEnable, &benchEnable)
+PARAM_ADD(PARAM_UINT8, mellingerEnable, &mellingerEnable)
 PARAM_ADD(PARAM_FLOAT, hoverRpm, &hoverRpm)
 PARAM_ADD(PARAM_FLOAT, maxRpm, &maxRpm)
 PARAM_ADD(PARAM_FLOAT, kf, &kf)
@@ -284,8 +333,8 @@ LOG_ADD(LOG_FLOAT, nf1, &normalizedForcesOut[1])
 LOG_ADD(LOG_FLOAT, nf2, &normalizedForcesOut[2])
 LOG_ADD(LOG_FLOAT, nf3, &normalizedForcesOut[3])
 LOG_ADD(LOG_UINT32, actPackets, &actPacketsReceived)
-// 0=PID, 1=stream, 2=bench. Reports which controller actually drove the
-// motors, not merely what the operator requested.
+// 0=PID, 1=stream, 2=bench, 3=mellinger. Reports which controller actually
+// drove the motors, not merely what the operator requested.
 LOG_ADD(LOG_UINT8, mode, &modeLog)
 // Ground-measured send period in ms (see action_channel.h) — this is the
 // direct measurement of the stream rate that crazyflie_ros' README calls a
